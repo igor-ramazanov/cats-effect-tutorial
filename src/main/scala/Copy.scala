@@ -8,7 +8,7 @@ import shapeless.tag.@@
 
 import scala.util.Try
 
-object Main extends IOApp {
+object Copy extends IOApp {
   sealed trait BytesCountTag
   sealed trait FilesCountTag
   type BytesCount = Long @@ BytesCountTag
