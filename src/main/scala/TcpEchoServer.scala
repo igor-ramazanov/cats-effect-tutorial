@@ -1,140 +1,238 @@
-import cats.effect._
-import cats.effect.ExitCase._
-import cats.effect.concurrent.MVar
-import cats.effect.syntax.all._
-import cats.implicits._
-import java.io._
 import java.net._
-import java.util.concurrent.Executors
+import java.nio.ByteBuffer
+import java.nio.channels.{
+  AsynchronousChannelGroup,
+  AsynchronousServerSocketChannel,
+  AsynchronousSocketChannel,
+  CompletionHandler
+}
+import java.util.concurrent.{ExecutorService, Executors}
+
+import cats.effect._
+import cats.effect.concurrent.MVar
+import cats.effect.implicits._
+import cats.implicits._
 
 import scala.concurrent.{ExecutionContext, ExecutionContextExecutor}
-import scala.util.Try
 
+/**
+  * Asynchronous TCP NIO2 echo server.
+  * For the better understanding and easier debugging all thread-pools are single-threaded.
+  *
+  * Even with single-threaded pools it's able to concurrently process many users.
+  *
+  * Pay attention to the thread name in logs after `Async[F].async` operations.
+  *
+  * '''Try to check your understanding by guessing thread names in putStrLn logs before actual running!'''
+  *
+  * After running connect by `telnet localhost 5432`
+  *
+  * "STOP" - stops server
+  * empty line - closes connection
+  * any other string - returns echo
+  *
+  * @see [[https://gist.github.com/djspiewak/46b543800958cf61af6efa8e072bfd5c]]
+  * @see [[https://typelevel.org/cats-effect/tutorial/tutorial.html]]
+  */
 object TcpEchoServer extends IOApp {
+
+  /**
+    * Event-loop pool, handles incoming connections and schedules actual work on other dedicated pools.
+    * Threads in this type of pool normally should have a maximum priority.
+    * Normally should be a fixed-size thread pool with the size of 1 or 2.
+    */
+  val handlerPool: ExecutionContextExecutor = ExecutionContext
+    .fromExecutor(
+      Executors
+        .newSingleThreadExecutor(
+          (r: Runnable) => createDaemonThread(r, "event-loop-pool")
+        )
+    )
+
+  /**
+    * IO-pool for executing blocking and long computations.
+    * Normally should be an unbounded cached thread pool.
+    */
+  val ioPool: ExecutorService =
+    Executors.newSingleThreadExecutor(createDaemonThread(_, "io-pool"))
+
+  /**
+    * CPU-pool for executing CPU-heavy tasks.
+    * Normally should be a fixed-size thread pool with
+    * {{{Runtime.getRuntime.availableProcessors()}}}
+    * or
+    * {{{Runtime.getRuntime.availableProcessors() * 2}}} number of threads.
+    */
+  val cpuPool: ExecutionContext = ExecutionContext.fromExecutor(
+    Executors.newSingleThreadExecutor(createDaemonThread(_, "cpu-pool"))
+  )
+
+  /**
+    * Timer pool, schedules tasks on the [[handlerPool]] pool.
+    * Threads priority and count are questionable and not clear for me.
+    * Intuition and rationality tells me it should be a 1-2 fixed-size thread pool with the highest priority.
+    */
+  override implicit protected def timer: Timer[IO] =
+    IO.timer(
+      handlerPool,
+      Executors.newSingleThreadScheduledExecutor(
+        (r: Runnable) => createDaemonThread(r, "scheduler-pool")
+      )
+    )
+
+  /**
+    * "Saves" the [[handlerPool]] pool into its context.
+    * [[ContextShift.shift]] operation forces asynchronous boundary
+    * by rescheduling following IO-suspended operations to the stored [[handlerPool]].
+    */
+  override implicit protected def contextShift: ContextShift[IO] =
+    IO.contextShift(handlerPool)
+
+  def createDaemonThread(r: Runnable, name: String): Thread = {
+    val t = new Thread(r, name)
+    t.setDaemon(true)
+    t
+  }
+
   override def run(args: List[String]): IO[ExitCode] = {
 
-    def close[F[_]: Sync](socket: ServerSocket): F[Unit] =
+    def close[F[_]: Sync](socket: AsynchronousServerSocketChannel): F[Unit] =
       Sync[F].delay(socket.close()).handleErrorWith(_ => Sync[F].unit)
 
-    IO(new ServerSocket(args.headOption.map(_.toInt).getOrElse(5432)))
-      .bracket { serverSocket =>
-        server[IO](serverSocket)
-      } { serverSocket =>
-        close[IO](serverSocket) >> IO(println("Server finished"))
+    IO.delay(
+        AsynchronousServerSocketChannel
+          .open(AsynchronousChannelGroup.withThreadPool(ioPool))
+          .bind(new InetSocketAddress("localhost", 5432))
+      )
+      .bracket { asynchronousServerSocketChannel =>
+        server[IO](asynchronousServerSocketChannel) >>= (
+          code =>
+            putStrLn[IO](s"server finishing, $currentThreadName") >>
+              code.pure[IO]
+        )
+      } { asynchronousServerSocketChannel =>
+        close[IO](asynchronousServerSocketChannel) >>
+          putStrLn[IO](s"server closed, $currentThreadName")
       }
   }
 
-  def server[F[_]: Concurrent](serverSocket: ServerSocket): F[ExitCode] = {
-
-    val clientsThreadPool = Executors.newCachedThreadPool()
-    implicit val clientsExecutionContext: ExecutionContextExecutor =
-      ExecutionContext.fromExecutor(clientsThreadPool)
-
+  def server[F[_]: Concurrent: ContextShift](
+    asynchronousServerSocketChannel: AsynchronousServerSocketChannel
+  ): F[ExitCode] = {
     for {
       stopFlag <- MVar[F].empty[Unit]
-      serverFiber <- serve(serverSocket, stopFlag).start // Server runs on its own Fiber
-      _ <- stopFlag.read // Blocked until 'stopFlag.put(())' is run
-      _ <- Sync[F].delay(clientsThreadPool.shutdown()) // Shutting down clients pool
-      _ <- serverFiber.cancel.start // Stopping server
+      serverFiber <- serve(asynchronousServerSocketChannel, stopFlag).start
+      _ <- stopFlag.read
+      _ <- serverFiber.cancel.start
     } yield ExitCode.Success
   }
 
-  def serve[F[_]: Concurrent](
-    serverSocket: ServerSocket,
+  def serve[F[_]: Concurrent: ContextShift](
+    asynchronousServerSocketChannel: AsynchronousServerSocketChannel,
     stopFlag: MVar[F, Unit]
-  )(implicit clientsExecutionContext: ExecutionContext): F[Unit] = {
+  ): F[Unit] = {
 
-    def close(socket: Socket): F[Unit] =
+    def close(socket: AsynchronousSocketChannel): F[Unit] =
       Sync[F].delay(socket.close()).handleErrorWith(_ => Sync[F].unit)
 
     for {
-      socket <- Sync[F]
-        .delay(serverSocket.accept())
-        .bracketCase { socket =>
-          echoProtocol(socket, stopFlag)
-            .guarantee(close(socket)) // Ensuring socket is closed
-            .start >> Sync[F].pure(socket) // Client attended by its own Fiber, socket is returned
-        } { (socket, exit) =>
-          exit match {
-            case Completed           => Sync[F].unit
-            case Error(_) | Canceled => close(socket)
-          }
+      _ <- putStrLn(s"before .accept(), $currentThreadName")
+      errorOrSocket <- Async[F]
+        .async[AsynchronousSocketChannel] { cb =>
+          asynchronousServerSocketChannel.accept(
+            ".accept()",
+            completionHandler(cb)
+          )
         }
-      _ <- (stopFlag.read >> close(socket)).start // Another Fiber to cancel the client when stopFlag is set
-      _ <- serve(serverSocket, stopFlag) // Looping back to the beginning
+        .attempt
+      _ <- putStrLn(s"after .accept(), $currentThreadName")
+      _ <- ContextShift[F].shift
+      _ <- putStrLn(s"shifted, $currentThreadName")
+      _ <- errorOrSocket.fold(
+        e => putStrLn(s"failed to create socket: $e, ${e.getMessage}"),
+        socket =>
+          for {
+            fiber <- echoProtocol(socket, stopFlag).start
+            _ <- (fiber.join >> close(socket)).start
+          } yield ()
+      )
+      _ <- putStrLn(s"after socketFiber.start, $currentThreadName")
+      _ <- serve(asynchronousServerSocketChannel, stopFlag)
     } yield ()
   }
 
-  def echoProtocol[F[_]: Async](clientSocket: Socket, stopFlag: MVar[F, Unit])(
-    implicit clientsExecutionContext: ExecutionContext
+  def echoProtocol[F[_]: Async: ContextShift](
+    clientSocket: AsynchronousSocketChannel,
+    stopFlag: MVar[F, Unit]
   ): F[Unit] = {
+    val buffer = ByteBuffer.allocateDirect(1024)
+    //buffer.array() fails for unknown reason
+    val secondBuffer = Array.ofDim[Byte](1024)
 
-    def loop(reader: BufferedReader,
-             writer: BufferedWriter,
-             stopFlag: MVar[F, Unit]): F[Unit] =
+    def loop(): F[Unit] =
       for {
-        lineE <- Async[F].async[Either[Throwable, String]] {
-          (cb: Either[Throwable, Either[Throwable, String]] => Unit) =>
-            clientsExecutionContext.execute(() => {
-              val result: Either[Throwable, String] =
-                Try(reader.readLine()).toEither
-              cb(Right(result))
-            })
+        _ <- putStrLn(s"before .read(), $currentThreadName")
+        count <- Async[F].async[Integer] { cb =>
+          clientSocket.read(buffer, ".read()", completionHandler(cb))
         }
-        _ <- lineE match {
-          case Right(line) =>
-            line match {
-              case "STOP" =>
-                stopFlag.put(()) // Stopping server! Also put(()) returns F[Unit] which is handy as we are done
-              case "" => Sync[F].unit // Empty line, we are done
+        _ <- putStrLn(s"after .read(), $currentThreadName")
+        _ <- ContextShift[F].shift
+        _ <- putStrLn(s"shifted, $currentThreadName")
+        _ <- if (count != -1) {
+          for {
+            _ <- putStrLn(s"before response calculation, $currentThreadName")
+            line <- ContextShift[F].evalOn(cpuPool)(
+              Sync[F]
+                .delay {
+                  //assume we have a CPU-heavy task here for calculating an answer
+                  println(s"response calculation, $currentThreadName")
+                  buffer.flip()
+                  buffer.get(secondBuffer, 0, count)
+                  buffer.position(0)
+                  new String(secondBuffer.slice(0, count)).trim
+                }
+            )
+            _ <- putStrLn(s"after response calculation, $currentThreadName")
+            _ <- line match {
+              case "STOP" => stopFlag.put(())
+              case ""     => putStrLn(s"closing socket, $currentThreadName")
               case _ =>
-                Sync[F].delay {
-                  writer.write(line); writer.newLine(); writer.flush()
-                } >> loop(reader, writer, stopFlag)
+                for {
+                  _ <- putStrLn(s"before .write(), $currentThreadName")
+                  _ <- Async[F].async[Integer] { cb =>
+                    clientSocket.write(
+                      buffer,
+                      ".write()",
+                      completionHandler(cb)
+                    )
+                  }
+                  _ <- putStrLn(s"after .write(), $currentThreadName")
+                  _ <- ContextShift[F].shift
+                  _ <- putStrLn(s"shifted, $currentThreadName")
+                  _ <- Sync[F].delay(buffer.clear())
+                  _ <- loop()
+                } yield ()
             }
-          case Left(e) =>
-            for { // readLine() failed, stopFlag will tell us whether this is a graceful shutdown
-              isEmpty <- stopFlag.isEmpty
-              _ <- if (!isEmpty)
-                Sync[F].unit // stopFlag is set, cool, we are done
-              else
-                Sync[F]
-                  .raiseError[Unit](e) // stopFlag not set, must raise error
-            } yield ()
-        }
+          } yield ()
+        } else putStrLn(s"socket closed, $currentThreadName")
       } yield ()
 
-    def reader(clientSocket: Socket): Resource[F, BufferedReader] =
-      Resource.make {
-        Sync[F].delay(
-          new BufferedReader(
-            new InputStreamReader(clientSocket.getInputStream())
-          )
-        )
-      } { reader =>
-        Sync[F].delay(reader.close()).handleErrorWith(_ => Sync[F].unit)
-      }
-
-    def writer(clientSocket: Socket): Resource[F, BufferedWriter] =
-      Resource.make {
-        Sync[F].delay(
-          new BufferedWriter(new PrintWriter(clientSocket.getOutputStream()))
-        )
-      } { writer =>
-        Sync[F].delay(writer.close()).handleErrorWith(_ => Sync[F].unit)
-      }
-
-    def readerWriter(
-      clientSocket: Socket
-    ): Resource[F, (BufferedReader, BufferedWriter)] =
-      for {
-        reader <- reader(clientSocket)
-        writer <- writer(clientSocket)
-      } yield (reader, writer)
-
-    readerWriter(clientSocket).use {
-      case (reader, writer) =>
-        loop(reader, writer, stopFlag) // Let's get to work
-    }
+    loop()
   }
+
+  def completionHandler[A](
+    cb: Either[Throwable, A] => Unit
+  ): CompletionHandler[A, String] = new CompletionHandler[A, String] {
+    override def completed(result: A, attachment: String): Unit = {
+      println(s"inside async $attachment, $currentThreadName")
+      cb(Right(result))
+    }
+
+    override def failed(exc: Throwable, attachment: String): Unit =
+      cb(Left(exc))
+  }
+
+  def putStrLn[F[_]: Sync](s: String): F[Unit] = Sync[F].delay(println(s))
+
+  def currentThreadName: String = Thread.currentThread().getName
 }
